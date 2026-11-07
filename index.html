@@ -112,6 +112,12 @@ textarea {
 				<option value="ip">Only IP</option>
 			</select>
 		</label>
+		<label class="row">Names via
+			<select id="names">
+				<option value="add">addIceCandidate</option>
+				<option value="sdp">SDP</option>
+			</select>
+		</label>
 	</div>
 
 	<div class="row">
@@ -143,6 +149,7 @@ textarea {
 const $ = (id) => document.getElementById(id);
 const CODE_KEY = 'spike.code';
 const MODE_KEY = 'spike.mode';
+const NAMES_KEY = 'spike.names';
 const RETRY_SECONDS = [1, 2, 5, 10, 30];
 const CONNECT_TIMEOUT_MS = 10000;
 
@@ -204,10 +211,16 @@ function randomIceString(length) {
 	return Array.from(bytes, (b) => alphabet[b % alphabet.length]).join('');
 }
 
-/** The server's answer, built here from the pairing code: the server never sees our offer. */
-function buildAnswer(code, offerSdp, mode) {
+/**
+ * The server's answer, built here from the pairing code: the server never sees our offer.
+ * With `namesVia === 'add'`, .local names stay out of the SDP and go through addIceCandidate
+ * afterwards, since a browser may resolve names only on that path.
+ */
+function buildAnswer(code, offerSdp, mode, namesVia) {
 	const mid = /a=mid:(\S+)/.exec(offerSdp)?.[1] ?? '0';
 	const hosts = code.h.filter((host) => mode === 'all' || (mode === 'mdns') === host.endsWith('.local'));
+	const late = namesVia === 'add' ? hosts.filter((host) => host.endsWith('.local')) : [];
+	const inSdp = hosts.filter((host) => !late.includes(host));
 	const ufrag = randomIceString(8);
 	const lines = [
 		'v=0',
@@ -219,8 +232,8 @@ function buildAnswer(code, offerSdp, mode) {
 		'a=msid-semantic: WMS',
 		`m=application ${code.o} UDP/DTLS/SCTP webrtc-datachannel`,
 		'c=IN IP4 0.0.0.0',
-		...hosts.map((host, i) => `a=candidate:${i + 1} 1 udp ${2130706431 - i} ${host} ${code.o} typ host`),
-		'a=end-of-candidates',
+		...inSdp.map((host, i) => `a=candidate:${i + 1} 1 udp ${2130706431 - i} ${host} ${code.o} typ host`),
+		...(late.length === 0 ? ['a=end-of-candidates'] : []),
 		`a=ice-ufrag:${ufrag}`,
 		`a=ice-pwd:${code.p}`,
 		`a=fingerprint:sha-256 ${code.fingerprint}`,
@@ -229,7 +242,23 @@ function buildAnswer(code, offerSdp, mode) {
 		'a=sctp-port:5000',
 		'a=max-message-size:262144',
 	];
-	return { sdp: lines.join('\r\n') + '\r\n', ufrag, hosts };
+	return { sdp: lines.join('\r\n') + '\r\n', ufrag, hosts, late, mid };
+}
+
+/** Which server address the connection actually went through. */
+async function logSelectedPair(peer) {
+	try {
+		const stats = await peer.getStats();
+		let pair = null;
+		stats.forEach((s) => {
+			if (s.type === 'transport' && s.selectedCandidatePairId) pair = stats.get(s.selectedCandidatePairId);
+		});
+		if (!pair) stats.forEach((s) => { if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') pair = s; });
+		const remote = pair && stats.get(pair.remoteCandidateId);
+		log(remote ? `went through ${remote.address || '(hidden)'}:${remote.port} (${remote.candidateType})` : 'selected pair not reported');
+	} catch (error) {
+		log(`stats: ${error.message}`);
+	}
 }
 
 let pc = null;
@@ -288,6 +317,7 @@ async function connect(reason) {
 		log(`channel open in ${since()}`);
 		setStatus('Connected', 'open');
 		send({ t: 'hello', token: code.k, label: deviceLabel() });
+		logSelectedPair(peer);
 	});
 	channel.addEventListener('close', () => teardown(peer, 'channel closed'));
 	channel.addEventListener('message', onMessage);
@@ -295,14 +325,26 @@ async function connect(reason) {
 	try {
 		const offer = await peer.createOffer();
 		await peer.setLocalDescription(offer);
-		const answer = buildAnswer(code, offer.sdp, $('mode').value);
+		const answer = buildAnswer(code, offer.sdp, $('mode').value, $('names').value);
 		if (answer.hosts.length === 0) {
 			log(`no addresses for mode "${$('mode').value}"`);
 			teardown(peer, 'no addresses');
 			return;
 		}
-		log(`connecting (${reason}) to ${answer.hosts.join(', ')} port ${code.o}, server ufrag ${answer.ufrag}`);
+		log(`connecting (${reason}) to ${answer.hosts.join(', ')} port ${code.o}, names via ${$('names').value}, server ufrag ${answer.ufrag}`);
 		await peer.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
+		for (const [i, host] of answer.late.entries()) {
+			const candidate = `candidate:${100 + i} 1 udp ${2130706331 - i} ${host} ${code.o} typ host`;
+			try {
+				await peer.addIceCandidate({ candidate, sdpMid: answer.mid, sdpMLineIndex: 0 });
+				log(`added ${host} via addIceCandidate`);
+			} catch (error) {
+				log(`addIceCandidate ${host} failed: ${error.name}: ${error.message}`);
+			}
+		}
+		if (answer.late.length > 0) {
+			try { await peer.addIceCandidate(null); } catch {}
+		}
 	} catch (error) {
 		log(`setup failed: ${error.name}: ${error.message}`);
 		teardown(peer, 'setup failed');
@@ -470,10 +512,12 @@ $('forgetCode').addEventListener('click', () => {
 	showServer();
 });
 $('mode').addEventListener('change', () => storageSet(MODE_KEY, $('mode').value));
+$('names').addEventListener('change', () => storageSet(NAMES_KEY, $('names').value));
 document.addEventListener('visibilitychange', () => onVisible('visibility'));
 window.addEventListener('pageshow', (event) => { if (event.persisted) onVisible('restored'); });
 
 $('mode').value = storageGet(MODE_KEY) ?? 'all';
+$('names').value = storageGet(NAMES_KEY) ?? 'add';
 $('env').textContent = `${deviceLabel()} · secure context: ${window.isSecureContext} · ${navigator.userAgent}`;
 
 if (location.hash.length > 1) {
