@@ -1,0 +1,4 @@
+# The server's private key and token.
+server/identity*.json
+server/spike-server
+.DS_Store

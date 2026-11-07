@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>WebRTC Direct Spike</title>
+<meta name="description" content="Throwaway test page: connect to a LAN server over WebRTC with no signaling exchange.">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#1f4fd1">
+<style>
+:root {
+	color-scheme: light dark;
+	--bg: #ffffff;
+	--fg: #1a1a1a;
+	--muted: #5c5c5c;
+	--line: #d4d4d4;
+	--panel: #f4f4f4;
+	--ok: #1b6e2a;
+	--bad: #a3201c;
+	--accent: #1f4fd1;
+	--on-accent: #ffffff;
+}
+@media (prefers-color-scheme: dark) {
+	:root:not([data-theme='light']) {
+		--bg: #141414;
+		--fg: #ececec;
+		--muted: #a6a6a6;
+		--line: #3a3a3a;
+		--panel: #1f1f1f;
+		--ok: #6fd383;
+		--bad: #ff8a80;
+		--accent: #8fb0ff;
+		--on-accent: #0b1a3d;
+	}
+}
+:root[data-theme='dark'] {
+	--bg: #141414;
+	--fg: #ececec;
+	--muted: #a6a6a6;
+	--line: #3a3a3a;
+	--panel: #1f1f1f;
+	--ok: #6fd383;
+	--bad: #ff8a80;
+	--accent: #8fb0ff;
+	--on-accent: #0b1a3d;
+}
+* { box-sizing: border-box; }
+body {
+	margin: 0;
+	padding: 16px;
+	background: var(--bg);
+	color: var(--fg);
+	font: 1rem/1.5 system-ui, -apple-system, sans-serif;
+}
+main { max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+h1 { font-size: 1.25rem; margin: 0; }
+.status { font-weight: 600; }
+.status[data-state='open'] { color: var(--ok); }
+.status[data-state='closed'] { color: var(--bad); }
+.muted { color: var(--muted); font-size: 0.875rem; overflow-wrap: anywhere; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+button, select {
+	font: inherit;
+	padding: 8px 14px;
+	border-radius: 8px;
+	border: 1px solid var(--line);
+	background: var(--panel);
+	color: var(--fg);
+}
+button.primary { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+textarea {
+	width: 100%;
+	font: 1rem/1.4 ui-monospace, monospace;
+	padding: 8px;
+	border-radius: 8px;
+	border: 1px solid var(--line);
+	background: var(--panel);
+	color: var(--fg);
+}
+#log {
+	margin: 0;
+	padding: 12px;
+	min-height: 240px;
+	max-height: 60vh;
+	overflow: auto;
+	background: var(--panel);
+	border-radius: 8px;
+	font: 0.8125rem/1.45 ui-monospace, monospace;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+#flash { min-height: 1.5em; font-weight: 600; color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+	<h1>WebRTC Direct Spike</h1>
+	<p class="status" id="status" data-state="closed">Not connected</p>
+	<p class="muted" id="env"></p>
+	<p class="muted" id="server">No pairing code yet.</p>
+
+	<div class="row">
+		<button class="primary" id="connect" type="button">Connect</button>
+		<button id="disconnect" type="button">Disconnect</button>
+		<label class="row">Addresses
+			<select id="mode">
+				<option value="all">All</option>
+				<option value="mdns">Only .local</option>
+				<option value="ip">Only IP</option>
+			</select>
+		</label>
+	</div>
+
+	<div class="row">
+		<button id="echo" type="button">Echo ×10</button>
+		<button id="blob" type="button">Get 1 MB</button>
+		<button id="touch" type="button">Touch</button>
+	</div>
+	<p id="flash" aria-live="polite"></p>
+
+	<div class="row">
+		<button id="copyLog" type="button">Copy log</button>
+		<button id="clearLog" type="button">Clear log</button>
+	</div>
+	<pre id="log" aria-live="off"></pre>
+
+	<details>
+		<summary>Pairing code</summary>
+		<p class="muted">Paste the code from the server page (needed inside an installed app, which keeps its own storage).</p>
+		<textarea id="code" rows="4"></textarea>
+		<div class="row">
+			<button id="saveCode" type="button">Save code</button>
+			<button id="forgetCode" type="button">Forget code</button>
+		</div>
+	</details>
+</main>
+<script>
+'use strict';
+
+const $ = (id) => document.getElementById(id);
+const CODE_KEY = 'spike.code';
+const MODE_KEY = 'spike.mode';
+const RETRY_SECONDS = [1, 2, 5, 10, 30];
+const CONNECT_TIMEOUT_MS = 10000;
+
+const logLines = [];
+function log(message) {
+	const now = new Date();
+	const stamp = now.toTimeString().slice(0, 8) + '.' + String(now.getMilliseconds()).padStart(3, '0');
+	const line = `${stamp} ${message}`;
+	logLines.push(line);
+	$('log').textContent = logLines.join('\n');
+	$('log').scrollTop = $('log').scrollHeight;
+	console.log(line);
+}
+
+function storageGet(key) {
+	try { return localStorage.getItem(key); } catch { return null; }
+}
+function storageSet(key, value) {
+	try { value === null ? localStorage.removeItem(key) : localStorage.setItem(key, value); } catch {}
+}
+
+function fromBase64Url(text) {
+	const base64 = text.replace(/-/g, '+').replace(/_/g, '/');
+	const binary = atob(base64 + '==='.slice((base64.length + 3) % 4));
+	return Uint8Array.from(binary, (ch) => ch.charCodeAt(0));
+}
+
+function decodeCode(text) {
+	const code = JSON.parse(new TextDecoder().decode(fromBase64Url(text.trim())));
+	if (code.v !== 1 || !code.p || !code.f || !code.o || !Array.isArray(code.h) || !code.k) {
+		throw new Error('not a spike pairing code');
+	}
+	const fingerprint = Array.from(fromBase64Url(code.f), (b) => b.toString(16).padStart(2, '0').toUpperCase()).join(':');
+	return { ...code, fingerprint };
+}
+
+function currentCode() {
+	const raw = storageGet(CODE_KEY);
+	if (!raw) return null;
+	try { return decodeCode(raw); } catch { return null; }
+}
+
+function deviceLabel() {
+	const ua = navigator.userAgent;
+	const device = /iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) ? 'iPad' : /Android/.test(ua) ? 'Android'
+		: /Macintosh/.test(ua) ? 'Mac' : /Windows/.test(ua) ? 'Windows' : /Linux/.test(ua) ? 'Linux' : 'Device';
+	const browser = /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera' : /FxiOS|Firefox/.test(ua) ? 'Firefox'
+		: /CriOS|Chrome/.test(ua) ? 'Chrome' : /Safari/.test(ua) ? 'Safari' : 'browser';
+	return `${device} ${browser} (${isStandalone() ? 'installed' : 'tab'})`;
+}
+
+function isStandalone() {
+	return window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+}
+
+function randomIceString(length) {
+	const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+	const bytes = crypto.getRandomValues(new Uint8Array(length));
+	return Array.from(bytes, (b) => alphabet[b % alphabet.length]).join('');
+}
+
+/** The server's answer, built here from the pairing code: the server never sees our offer. */
+function buildAnswer(code, offerSdp, mode) {
+	const mid = /a=mid:(\S+)/.exec(offerSdp)?.[1] ?? '0';
+	const hosts = code.h.filter((host) => mode === 'all' || (mode === 'mdns') === host.endsWith('.local'));
+	const ufrag = randomIceString(8);
+	const lines = [
+		'v=0',
+		`o=- ${Date.now()} 2 IN IP4 127.0.0.1`,
+		's=-',
+		't=0 0',
+		`a=group:BUNDLE ${mid}`,
+		'a=ice-lite',
+		'a=msid-semantic: WMS',
+		`m=application ${code.o} UDP/DTLS/SCTP webrtc-datachannel`,
+		'c=IN IP4 0.0.0.0',
+		...hosts.map((host, i) => `a=candidate:${i + 1} 1 udp ${2130706431 - i} ${host} ${code.o} typ host`),
+		'a=end-of-candidates',
+		`a=ice-ufrag:${ufrag}`,
+		`a=ice-pwd:${code.p}`,
+		`a=fingerprint:sha-256 ${code.fingerprint}`,
+		'a=setup:passive',
+		`a=mid:${mid}`,
+		'a=sctp-port:5000',
+		'a=max-message-size:262144',
+	];
+	return { sdp: lines.join('\r\n') + '\r\n', ufrag, hosts };
+}
+
+let pc = null;
+let dc = null;
+let manualStop = false;
+let retryIndex = 0;
+let retryTimer = 0;
+let connectTimer = 0;
+let pingTimer = 0;
+let echoRun = null;
+let blob = null;
+
+function setStatus(text, state) {
+	$('status').textContent = text;
+	$('status').dataset.state = state;
+}
+
+function flash(text) {
+	$('flash').textContent = text;
+	clearTimeout(flash.timer);
+	flash.timer = setTimeout(() => { $('flash').textContent = ''; }, 4000);
+}
+
+function send(frame) {
+	if (dc?.readyState === 'open') dc.send(JSON.stringify(frame));
+	else log('not connected');
+}
+
+async function connect(reason) {
+	if (pc) return;
+	const code = currentCode();
+	if (!code) {
+		log('no pairing code: scan the QR on the server page or paste the code below');
+		return;
+	}
+	clearTimeout(retryTimer);
+	manualStop = false;
+
+	const started = performance.now();
+	const since = () => `${Math.round(performance.now() - started)} ms`;
+	const peer = new RTCPeerConnection({ iceServers: [] });
+	const channel = peer.createDataChannel('spike');
+	channel.binaryType = 'arraybuffer';
+	pc = peer;
+	dc = channel;
+	setStatus('Connecting…', 'connecting');
+
+	peer.addEventListener('iceconnectionstatechange', () => log(`ice ${peer.iceConnectionState} (+${since()})`));
+	peer.addEventListener('connectionstatechange', () => {
+		log(`connection ${peer.connectionState} (+${since()})`);
+		if (['failed', 'closed', 'disconnected'].includes(peer.connectionState)) teardown(peer, `connection ${peer.connectionState}`);
+	});
+	channel.addEventListener('open', () => {
+		clearTimeout(connectTimer);
+		retryIndex = 0;
+		log(`channel open in ${since()}`);
+		setStatus('Connected', 'open');
+		send({ t: 'hello', token: code.k, label: deviceLabel() });
+	});
+	channel.addEventListener('close', () => teardown(peer, 'channel closed'));
+	channel.addEventListener('message', onMessage);
+
+	try {
+		const offer = await peer.createOffer();
+		await peer.setLocalDescription(offer);
+		const answer = buildAnswer(code, offer.sdp, $('mode').value);
+		if (answer.hosts.length === 0) {
+			log(`no addresses for mode "${$('mode').value}"`);
+			teardown(peer, 'no addresses');
+			return;
+		}
+		log(`connecting (${reason}) to ${answer.hosts.join(', ')} port ${code.o}, server ufrag ${answer.ufrag}`);
+		await peer.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
+	} catch (error) {
+		log(`setup failed: ${error.name}: ${error.message}`);
+		teardown(peer, 'setup failed');
+		return;
+	}
+	connectTimer = setTimeout(() => teardown(peer, `no connection within ${CONNECT_TIMEOUT_MS / 1000} s`), CONNECT_TIMEOUT_MS);
+}
+
+function teardown(peer, why) {
+	if (peer !== pc) return;
+	log(`disconnected: ${why}`);
+	clearTimeout(connectTimer);
+	clearTimeout(pingTimer);
+	try { dc?.close(); } catch {}
+	try { peer.close(); } catch {}
+	pc = null;
+	dc = null;
+	echoRun = null;
+	blob = null;
+	setStatus('Not connected', 'closed');
+	scheduleRetry();
+}
+
+function scheduleRetry() {
+	if (manualStop || document.visibilityState !== 'visible' || !currentCode()) return;
+	const seconds = RETRY_SECONDS[Math.min(retryIndex, RETRY_SECONDS.length - 1)];
+	retryIndex += 1;
+	log(`retry in ${seconds} s`);
+	clearTimeout(retryTimer);
+	retryTimer = setTimeout(() => connect('retry'), seconds * 1000);
+}
+
+function onMessage(event) {
+	if (typeof event.data !== 'string') {
+		if (!blob) return;
+		blob.received += event.data.byteLength;
+		if (blob.received >= blob.expected) {
+			const ms = performance.now() - blob.started;
+			log(`1 MB received in ${Math.round(ms)} ms (${(blob.expected / 1024 / 1024 / (ms / 1000)).toFixed(1)} MB/s)`);
+			blob = null;
+		}
+		return;
+	}
+	const frame = JSON.parse(event.data);
+	switch (frame.t) {
+		case 'welcome':
+			log(`welcome from "${frame.name}" (server ${frame.serverId}), seen as ${frame.remote}, ${frame.peers} connected, touch counter ${frame.version}`);
+			break;
+		case 'denied':
+			log(`denied: ${frame.reason}`);
+			break;
+		case 'echo':
+			onEcho(frame);
+			break;
+		case 'blob':
+			blob = { expected: frame.bytes, received: 0, started: blob?.started ?? performance.now() };
+			break;
+		case 'touched':
+			log(`touched, counter is now ${frame.version}`);
+			break;
+		case 'changed':
+			log(`changed by "${frame.from}", counter ${frame.version}`);
+			flash(`Changed by ${frame.from} (counter ${frame.version})`);
+			break;
+		default:
+			log(`message: ${event.data}`);
+	}
+}
+
+function onEcho(frame) {
+	const rtt = performance.now() - frame.ts;
+	if (frame.n === -1) {
+		clearTimeout(pingTimer);
+		log(`still alive (${Math.round(rtt)} ms)`);
+		return;
+	}
+	if (!echoRun) return;
+	echoRun.samples.push(rtt);
+	if (echoRun.samples.length < 10) {
+		send({ t: 'echo', n: echoRun.samples.length, ts: performance.now() });
+		return;
+	}
+	const samples = echoRun.samples;
+	const avg = samples.reduce((a, b) => a + b, 0) / samples.length;
+	log(`echo ×10: min ${Math.min(...samples).toFixed(1)} ms, avg ${avg.toFixed(1)} ms, max ${Math.max(...samples).toFixed(1)} ms`);
+	echoRun = null;
+}
+
+/** After returning to the page, check the channel still answers; a dead one is torn down. */
+function checkAlive() {
+	if (dc?.readyState !== 'open') return;
+	const peer = pc;
+	send({ t: 'echo', n: -1, ts: performance.now() });
+	clearTimeout(pingTimer);
+	pingTimer = setTimeout(() => teardown(peer, 'no answer after returning'), 3000);
+}
+
+function onVisible(reason) {
+	log(`${reason}: ${document.visibilityState}`);
+	if (document.visibilityState !== 'visible' || manualStop) return;
+	if (pc) {
+		checkAlive();
+	} else {
+		retryIndex = 0;
+		connect(reason);
+	}
+}
+
+function showServer() {
+	const code = currentCode();
+	$('server').textContent = code
+		? `Server "${code.n}": ${code.h.join(', ')}, UDP ${code.o}`
+		: 'No pairing code yet.';
+	$('code').value = storageGet(CODE_KEY) ?? '';
+}
+
+function saveCode(text, source) {
+	try {
+		decodeCode(text);
+	} catch (error) {
+		log(`bad code (${source}): ${error.message}`);
+		return false;
+	}
+	storageSet(CODE_KEY, text.trim());
+	log(`pairing code saved (${source})`);
+	showServer();
+	return true;
+}
+
+$('connect').addEventListener('click', () => { retryIndex = 0; connect('button'); });
+$('disconnect').addEventListener('click', () => {
+	manualStop = true;
+	clearTimeout(retryTimer);
+	if (pc) teardown(pc, 'button');
+});
+$('echo').addEventListener('click', () => {
+	echoRun = { samples: [] };
+	send({ t: 'echo', n: 0, ts: performance.now() });
+});
+$('blob').addEventListener('click', () => {
+	blob = { expected: Infinity, received: 0, started: performance.now() };
+	send({ t: 'blob', bytes: 1024 * 1024 });
+});
+$('touch').addEventListener('click', () => send({ t: 'touch' }));
+$('copyLog').addEventListener('click', async () => {
+	const text = [`page: ${location.href.split('#')[0]}`, `ua: ${navigator.userAgent}`, ...logLines].join('\n');
+	try {
+		await navigator.clipboard.writeText(text);
+		flash('Log copied');
+	} catch {
+		const range = document.createRange();
+		range.selectNodeContents($('log'));
+		getSelection().removeAllRanges();
+		getSelection().addRange(range);
+		flash('Select all and copy by hand');
+	}
+});
+$('clearLog').addEventListener('click', () => { logLines.length = 0; $('log').textContent = ''; });
+$('saveCode').addEventListener('click', () => {
+	if (saveCode($('code').value, 'pasted')) { retryIndex = 0; connect('new code'); }
+});
+$('forgetCode').addEventListener('click', () => {
+	storageSet(CODE_KEY, null);
+	log('pairing code forgotten');
+	showServer();
+});
+$('mode').addEventListener('change', () => storageSet(MODE_KEY, $('mode').value));
+document.addEventListener('visibilitychange', () => onVisible('visibility'));
+window.addEventListener('pageshow', (event) => { if (event.persisted) onVisible('restored'); });
+
+$('mode').value = storageGet(MODE_KEY) ?? 'all';
+$('env').textContent = `${deviceLabel()} · secure context: ${window.isSecureContext} · ${navigator.userAgent}`;
+
+if (location.hash.length > 1) {
+	saveCode(decodeURIComponent(location.hash.slice(1)), 'link');
+	history.replaceState(null, '', location.pathname + location.search);
+}
+showServer();
+
+if ('serviceWorker' in navigator && window.isSecureContext) {
+	navigator.serviceWorker.register('sw.js').catch((error) => log(`service worker: ${error.message}`));
+}
+
+log(`page loaded as ${deviceLabel()}`);
+connect('page load');
+</script>
+</body>
+</html>
